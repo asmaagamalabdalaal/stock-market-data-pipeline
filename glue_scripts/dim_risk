@@ -1,0 +1,141 @@
+import sys, io
+import boto3
+import pandas as pd
+import numpy as np
+
+s3 = boto3.client("s3")
+
+def get_arg(name, default=None):
+    k = f"--{name}"
+    return sys.argv[sys.argv.index(k)+1] if k in sys.argv else default
+
+def parse_s3(path):
+    path = path.replace("s3://", "", 1)
+    bucket, key = path.split("/", 1)
+    return bucket, key
+
+def s3_read_csv(path):
+    b, k = parse_s3(path)
+    obj = s3.get_object(Bucket=b, Key=k)
+    return pd.read_csv(io.BytesIO(obj["Body"].read()), encoding="utf-8-sig")
+
+def s3_write_csv(df, path):
+    b, k = parse_s3(path)
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    s3.put_object(
+        Bucket=b,
+        Key=k,
+        Body=buf.getvalue().encode("utf-8"),
+        ContentType="text/csv"
+    )
+
+def col(df, name):
+    return df[name] if (name is not None and name in df.columns) else pd.Series([pd.NA] * len(df))
+
+def smart_parse_date(s):
+    s = s.astype(str).str.strip()
+    out = pd.Series(pd.NaT, index=s.index)
+
+    mask_ymd = s.str.match(r"^\d{8}$")
+    out.loc[mask_ymd] = pd.to_datetime(s.loc[mask_ymd], format="%Y%m%d", errors="coerce")
+
+    mask_ts = s.str.match(r"^\d{10}$")
+    out.loc[mask_ts] = pd.to_datetime(s.loc[mask_ts].astype(float), unit="s", errors="coerce")
+
+    rest = ~(mask_ymd | mask_ts)
+    out.loc[rest] = pd.to_datetime(s.loc[rest], errors="coerce")
+    return out
+
+def pick_best_date_column(df):
+    candidates = ["price_date", "as_of_date", "date", "timestamp"] + \
+                 [c for c in df.columns if ("date" in c.lower() or "time" in c.lower())]
+    seen = set()
+    best_col, best_series, best_cnt = None, None, -1
+    for c in candidates:
+        if c in df.columns and c not in seen:
+            seen.add(c)
+            s = smart_parse_date(df[c])
+            cnt = int(s.notna().sum())
+            if cnt > best_cnt:
+                best_cnt = cnt
+                best_col, best_series = c, s
+    return best_col, best_series, best_cnt
+
+def pick_col(df, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+SILVER = get_arg("SILVER_BASE", "s3://yahoo-finance-silver/silver/").rstrip("/") + "/"
+GOLD   = get_arg("GOLD_BASE",   "s3://yahoo-finance-gold/tables/").rstrip("/") + "/"
+
+IN_PATH  = SILVER + "merged_etfs.csv"
+OUT_PATH = GOLD + "dim_risk/dim_risk.csv"
+
+m = s3_read_csv(IN_PATH)
+print("Loaded rows:", len(m))
+
+date_col, date_series, good = pick_best_date_column(m)
+if date_col is None or good <= 0:
+    dbg = GOLD + "dim_risk/_debug_no_dates.csv"
+    s3_write_csv(m.head(200), dbg)
+    raise ValueError(f"No usable date column found. Saved sample: {dbg}")
+
+print("Using date column:", date_col, "| parsable dates:", good)
+date_id = date_series.dt.strftime("%Y%m%d")
+
+
+mapping = {
+    "alpha_3years": ["alpha_3years", "fund_alpha_3years"],
+    "alpha_5years": ["alpha_5years", "fund_alpha_5years"],
+    "alpha_10years": ["alpha_10years", "fund_alpha_10years"],
+
+    "beta_3years": ["beta_3years", "fund_beta_3years"],
+    "beta_5years": ["beta_5years", "fund_beta_5years"],
+    "beta_10years": ["beta_10years", "fund_beta_10years"],
+
+    "sharpe_ratio_3years": ["sharpe_ratio_3years", "fund_sharpe_ratio_3years"],
+    "sharpe_ratio_5years": ["sharpe_ratio_5years", "fund_sharpe_ratio_5years"],
+    "sharpe_ratio_10years": ["sharpe_ratio_10years", "fund_sharpe_ratio_10years"],
+
+    "treynor_ratio_3years": ["treynor_ratio_3years", "fund_treynor_ratio_3years"],
+    "treynor_ratio_5years": ["treynor_ratio_5years", "fund_treynor_ratio_5years"],
+    "treynor_ratio_10years": ["treynor_ratio_10years", "fund_treynor_ratio_10years"],
+
+    "r_squared_3years": ["r_squared_3years", "fund_r_squared_3years", "r2_3years", "fund_r2_3years"],
+    "r_squared_5years": ["r_squared_5years", "fund_r_squared_5years", "r2_5years", "fund_r2_5years"],
+    "r_squared_10years": ["r_squared_10years", "fund_r_squared_10years", "r2_10years", "fund_r2_10years"],
+
+    "stdev_3years": ["stdev_3years", "fund_stdev_3years", "stddev_3years", "fund_stddev_3years"],
+    "stdev_5years": ["stdev_5years", "fund_stdev_5years", "stddev_5years", "fund_stddev_5years"],
+    "stdev_10years": ["stdev_10years", "fund_stdev_10years", "stddev_10years", "fund_stddev_10years"],
+
+    "mean_annual_return_3years": ["mean_annual_return_3years", "fund_mean_annual_return_3years"],
+    "mean_annual_return_5years": ["mean_annual_return_5years", "fund_mean_annual_return_5years"],
+}
+
+resolved = {k: pick_col(m, v) for k, v in mapping.items()}
+print("Resolved mapping:")
+for k, v in resolved.items():
+    print(f"  {k} -> {v}")
+
+
+df = pd.DataFrame({"date_id": pd.to_numeric(date_id, errors="coerce")})
+
+for target, src in resolved.items():
+    df[target] = pd.to_numeric(col(m, src), errors="coerce") if src else pd.Series([pd.NA] * len(m))
+
+print("Valid date_id:", int(df["date_id"].notna().sum()))
+df = df.dropna(subset=["date_id"])
+
+df = df.drop_duplicates(subset=["date_id"]).sort_values("date_id").reset_index(drop=True)
+
+df.insert(0, "risk_id", range(1, len(df) + 1))
+
+
+s3_write_csv(df, OUT_PATH)
+print("Saved:", OUT_PATH)
+print("Rows:", len(df))
+print(df.head(10))

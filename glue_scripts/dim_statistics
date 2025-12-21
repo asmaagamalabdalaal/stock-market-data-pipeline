@@ -1,0 +1,109 @@
+import sys, io
+import boto3
+import pandas as pd
+import numpy as np
+
+def get_arg(name, default=None):
+    k = f"--{name}"
+    return sys.argv[sys.argv.index(k)+1] if k in sys.argv else default
+
+def parse_s3(path):
+    path = path.replace("s3://", "", 1)
+    bucket, key = path.split("/", 1)
+    return bucket, key
+
+def s3_read_csv(path):
+    b, k = parse_s3(path)
+    obj = s3.get_object(Bucket=b, Key=k)
+    return pd.read_csv(io.BytesIO(obj["Body"].read()), encoding="utf-8-sig")
+
+def s3_write_csv(df, path):
+    b, k = parse_s3(path)
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    s3.put_object(
+        Bucket=b,
+        Key=k,
+        Body=buf.getvalue().encode("utf-8"),
+        ContentType="text/csv"
+    )
+
+def col(df, name):
+    return df[name] if name in df.columns else pd.Series([pd.NA] * len(df))
+
+def smart_parse_date(s):
+
+    s = s.astype(str).str.strip()
+
+    mask_ymd = s.str.match(r"^\d{8}$")
+    out = pd.Series(pd.NaT, index=s.index)
+
+    out[mask_ymd] = pd.to_datetime(s[mask_ymd], format="%Y%m%d", errors="coerce")
+
+    mask_ts = s.str.match(r"^\d{10}$")
+    out[mask_ts] = pd.to_datetime(s[mask_ts].astype(float), unit="s", errors="coerce")
+
+    rest = ~(mask_ymd | mask_ts)
+    out[rest] = pd.to_datetime(s[rest], errors="coerce")
+
+    return out
+
+
+s3 = boto3.client("s3")
+
+SILVER = get_arg("SILVER_BASE", "s3://yahoo-finance-silver/silver/").rstrip("/") + "/"
+GOLD   = get_arg("GOLD_BASE",   "s3://yahoo-finance-gold/tables/").rstrip("/") + "/"
+
+m = s3_read_csv(SILVER + "merged_etfs.csv")
+
+print("Columns:", list(m.columns))
+
+
+date_candidates = [c for c in m.columns if "date" in c.lower() or "time" in c.lower()]
+
+if not date_candidates:
+    raise ValueError("No date-like column names found at all.")
+
+print("Date candidates:", date_candidates)
+
+# Pick first candidate
+date_col = date_candidates[0]
+print("Using date column:", date_col)
+
+date_series = smart_parse_date(m[date_col])
+date_id = date_series.dt.strftime("%Y%m%d")
+
+
+df = pd.DataFrame({
+    "date_id": pd.to_numeric(date_id, errors="coerce"),
+    "week52_high": col(m,"week52_high"),
+    "week52_low": col(m,"week52_low"),
+    "week52_high_change": col(m,"week52_high_change"),
+    "week52_low_change": col(m,"week52_low_change"),
+    "week52_high_change_perc": col(m,"week52_high_change_perc"),
+    "week52_low_change_perc": col(m,"week52_low_change_perc"),
+    "week52_high_low_change": col(m,"week52_high_low_change"),
+    "week52_high_low_change_perc": col(m,"week52_high_low_change_perc"),
+    "day50_moving_average": col(m,"day50_moving_average"),
+    "day200_moving_average": col(m,"day200_moving_average"),
+    "years_up": col(m,"years_up"),
+    "years_down": col(m,"years_down"),
+    "annual_holdings_turnover": col(m,"annual_holdings_turnover"),
+    "top10_holdings_total_assets": col(m,"top10_holdings_total_assets"),
+    "total_net_assets": col(m,"total_net_assets")
+})
+
+print("Valid dates:", df["date_id"].notna().sum())
+
+df = df.dropna(subset=["date_id"])
+df = df.drop_duplicates(subset=["date_id"]).sort_values("date_id").reset_index(drop=True)
+
+df.insert(0, "stats_id", range(1, len(df)+1))
+
+
+out_path = GOLD + "dim_fund_statistics/dim_fund_statistics.csv"
+s3_write_csv(df, out_path)
+
+print("Saved:", out_path)
+print("Rows:", len(df))
+print(df.head())

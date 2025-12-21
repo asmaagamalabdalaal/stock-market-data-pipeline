@@ -1,0 +1,125 @@
+import sys
+import boto3
+import pandas as pd
+import numpy as np
+
+s3 = boto3.client("s3")
+
+def get_arg(name, default=None):
+    k = f"--{name}"
+    return sys.argv[sys.argv.index(k)+1] if k in sys.argv else default
+
+def parse_s3(path):
+    path = path.replace("s3://", "", 1)
+    b, k = path.split("/", 1)
+    return b, k
+
+def s3_get_body(path):
+    b, k = parse_s3(path)
+    return s3.get_object(Bucket=b, Key=k)["Body"]
+
+def s3_read_csv(path, **kwargs):
+    return pd.read_csv(s3_get_body(path), encoding="utf-8-sig", **kwargs)
+
+def clean_cols(df):
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+    return df
+
+def to_num(x):
+    return pd.to_numeric(x, errors="coerce")
+
+SILVER = get_arg("SILVER_BASE", "s3://yahoo-finance-silver/silver/").rstrip("/") + "/"
+MUTUAL_PRICES_PATH = SILVER + "mutualfund_prices_2000_a_z.csv"
+
+REQUIRED_COLUMNS = [
+    "close",
+    "fund_symbol",
+    "mutualprices_id",
+    "open",
+    "price_date"
+]
+
+def main():
+    print("\n" + "="*70)
+    print("Reading mutualfund_prices_2000_a_z table")
+    print("="*70)
+    
+    try:
+        print(f"\nReading from: {MUTUAL_PRICES_PATH}")
+        df = clean_cols(s3_read_csv(MUTUAL_PRICES_PATH))
+        
+        print(f"Loaded {len(df):,} rows")
+        print(f"Number of columns: {len(df.columns)}")
+        
+        print("\n" + "-"*70)
+        print("Available columns in file:")
+        print("-"*70)
+        for i, col in enumerate(df.columns, 1):
+            print(f"{i:2}. {col}")
+        
+        print("\n" + "-"*70)
+        print("Checking required columns:")
+        print("-"*70)
+        
+        missing_cols = []
+        present_cols = []
+        
+        for col in REQUIRED_COLUMNS:
+            if col in df.columns:
+                present_cols.append(col)
+                print(f"Found: {col}")
+            else:
+                missing_cols.append(col)
+                print(f"Missing: {col}")
+        
+        if missing_cols:
+            print(f"\nWarning: {len(missing_cols)} columns missing from required list")
+        else:
+            print(f"\nAll required columns present ({len(present_cols)})")
+        
+        print("\n" + "="*70)
+        print("Data information:")
+        print("="*70)
+        print(df.info())
+        
+        print("\n" + "="*70)
+        print("First 10 rows:")
+        print("="*70)
+        
+        display_cols = [col for col in REQUIRED_COLUMNS if col in df.columns]
+        print(df[display_cols].head(10).to_string(index=False))
+        
+        print("\n" + "="*70)
+        print("Numeric columns statistics:")
+        print("="*70)
+        numeric_cols = df[display_cols].select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            print(df[numeric_cols].describe().to_string())
+        else:
+            print("No numeric columns found")
+        
+        print("\n" + "="*70)
+        print("Unique and null counts per column:")
+        print("="*70)
+        for col in display_cols:
+            unique_count = df[col].nunique()
+            null_count = df[col].isna().sum()
+            print(f"{col:45} | Unique: {unique_count:8,} | Null: {null_count:8,}")
+        
+        print("\n" + "="*70)
+        print("Completed successfully")
+        print("="*70)
+        
+        return df
+        
+    except Exception as e:
+        print(f"\nError: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+if __name__ == "__main__":
+    df = main()
+    
+    if df is not None:
+        print("\nDataframe ready in variable 'df'")
