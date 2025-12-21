@@ -1,0 +1,94 @@
+import sys, io
+import boto3
+import pandas as pd
+import numpy as np
+
+# =========================
+# Helpers
+# =========================
+def get_arg(name, default=None):
+    k = f"--{name}"
+    return sys.argv[sys.argv.index(k)+1] if k in sys.argv else default
+
+def parse_s3(path):
+    path = path.replace("s3://", "", 1)
+    bucket, key = path.split("/", 1)
+    return bucket, key
+
+def s3_read_csv(path):
+    b, k = parse_s3(path)
+    obj = s3.get_object(Bucket=b, Key=k)
+    return pd.read_csv(io.BytesIO(obj["Body"].read()))
+
+def s3_write_csv(df, path):
+    b, k = parse_s3(path)
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    s3.put_object(
+        Bucket=b,
+        Key=k,
+        Body=buf.getvalue().encode("utf-8"),
+        ContentType="text/csv"
+    )
+
+def col(df, name):
+    return df[name] if name in df.columns else np.nan
+
+# =========================
+# S3 + Paths
+# =========================
+s3 = boto3.client("s3")
+
+SILVER = get_arg("SILVER_BASE", "s3://yahoo-finance-silver/silver/").rstrip("/") + "/"
+GOLD   = get_arg("GOLD_BASE",   "s3://yahoo-finance-gold/tables/").rstrip("/") + "/"
+
+# =========================
+# Load data
+# =========================
+merged = s3_read_csv(SILVER + "merged_etfs.csv")
+dim_fund = s3_read_csv(GOLD + "dim_fund/dim_fund.csv")
+
+merged["fund_symbol"] = merged["fund_symbol"].astype("string")
+dim_fund["fund_symbol"] = dim_fund["fund_symbol"].astype("string")
+
+df = merged.merge(
+    dim_fund[["fund_id", "fund_symbol"]],
+    on="fund_symbol",
+    how="left"
+)
+
+# =========================
+# Build dim_fund_composition
+# =========================
+out_df = pd.DataFrame({
+    "fund_id": df["fund_id"],
+
+    "sector_consumer_cyclical": col(df, "fund_sector_consumer_cyclical"),
+    "sector_basic_materials": col(df, "fund_sector_basic_materials"),
+    "sector_healthcare": col(df, "fund_sector_healthcare"),
+    "sector_financial_services": col(df, "fund_sector_financial_services"),
+    "sector_energy": col(df, "fund_sector_energy"),
+    "sector_utilities": col(df, "fund_sector_utilities"),
+    "sector_consumer_defensive": col(df, "fund_sector_consumer_defensive"),
+    "sector_industrials": col(df, "fund_sector_industrials"),
+    "sector_real_estate": col(df, "fund_sector_real_estate"),
+    "sector_technology": col(df, "fund_sector_technology"),
+    "sector_communication_services": col(df, "fund_sector_communication_services"),
+})
+
+# Remove duplicates (one row per fund)
+out_df = out_df.dropna(subset=["fund_id"])
+out_df = out_df.drop_duplicates(subset=["fund_id"])
+out_df = out_df.sort_values("fund_id").reset_index(drop=True)
+
+# Auto-increment surrogate key
+out_df.insert(0, "composition_id", range(1, len(out_df) + 1))
+
+# =========================
+# Save to GOLD
+# =========================
+out_path = GOLD + "dim_fund_composition/dim_fund_composition.csv"
+s3_write_csv(out_df, out_path)
+
+print("Saved:", out_path)
+print("Rows:", len(out_df))

@@ -1,0 +1,44 @@
+import sys, io, boto3, pandas as pd, numpy as np
+
+def get_arg(n, d=None):
+    k=f"--{n}"; return sys.argv[sys.argv.index(k)+1] if k in sys.argv else d
+
+def parse_s3(p):
+    p=p.replace("s3://","",1); b,k=p.split("/",1); return b,k
+
+def s3_read_csv(p):
+    b,k=parse_s3(p); obj=s3.get_object(Bucket=b,Key=k)
+    return pd.read_csv(io.BytesIO(obj["Body"].read()))
+
+def s3_write_csv(df,p):
+    b,k=parse_s3(p); buf=io.StringIO(); df.to_csv(buf,index=False)
+    s3.put_object(Bucket=b,Key=k,Body=buf.getvalue().encode("utf-8"),ContentType="text/csv")
+
+def col(df,name): return df[name] if name in df.columns else np.nan
+
+s3=boto3.client("s3")
+SILVER=get_arg("SILVER_BASE","s3://yahoo-finance-silver/silver/").rstrip("/")+"/"
+GOLD=get_arg("GOLD_BASE","s3://yahoo-finance-gold/tables/").rstrip("/")+"/"
+
+st = s3_read_csv(SILVER + "investment_strategy.csv")
+dim_fund = s3_read_csv(GOLD + "dim_fund/dim_fund.csv")
+
+st["fund_symbol"] = col(st,"fund_symbol").astype("string")
+dim_fund["fund_symbol"] = dim_fund["fund_symbol"].astype("string")
+
+x = st.merge(dim_fund[["fund_id","fund_symbol"]], on="fund_symbol", how="left")
+
+out_df = pd.DataFrame({
+    "fund_id": x["fund_id"],
+    "objective_type": col(x,"objective_type"),
+    "primary_asset_theme": col(x,"primary_asset_theme"),
+    "geo_focus": col(x,"geo_focus"),
+})
+
+out_df = out_df.dropna(subset=["fund_id"]).drop_duplicates()
+out_df = out_df.sort_values(["fund_id","objective_type"], na_position="last").reset_index(drop=True)
+out_df.insert(0, "investment_strategy_id", range(1, len(out_df)+1))
+
+out = GOLD + "investment_strategy/investment_strategy.csv"
+s3_write_csv(out_df, out)
+print("Saved:", out)
